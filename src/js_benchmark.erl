@@ -19,7 +19,7 @@
 
 -module(js_benchmark).
 
--define(COUNTS, [1000, 10000, 100000]).
+-define(COUNTS, [1000, 10000, 100000, 500000 ]).
 
 -export([run/0]).
 
@@ -30,7 +30,7 @@
 run() ->
     ok = application:start(erlang_js),
     {ok, Ctx} = js_driver:new(),
-    ok = js:define(Ctx, <<"function add(x, y) { return x + y; }">>, []),
+    ok = js:define(Ctx, <<"$add = sub { return $_[0] + $_[1]; }">>, []),
     Result = [time_calls(Ctx, Count) || Count <- ?COUNTS],
     js_driver:destroy(Ctx),
     Result.
@@ -47,5 +47,5 @@ do_calls(_Ctx, 0) ->
     ok;
 do_calls(Ctx, Count) ->
     CorrectResult = Count * 2,
-    {ok, CorrectResult} = js:call(Ctx, "add", [Count, Count]),
+    {ok, CorrectResult} = js:call(Ctx, "$add", [Count, Count]),
     do_calls(Ctx, Count - 1).

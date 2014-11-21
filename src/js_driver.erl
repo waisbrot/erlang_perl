@@ -27,7 +27,7 @@
 -export([define_js/2, define_js/3, define_js/4, eval_js/2, eval_js/3]).
 
 -define(SCRIPT_TIMEOUT, 5000).
--define(DRIVER_NAME, "erlang_js_drv").
+-define(DRIVER_NAME, "erlang_perl_drv").
 
 %% @spec load_driver() -> true | false
 %% @doc Attempt to load the Javascript driver
@@ -59,13 +59,7 @@ new() ->
 new(ThreadStackSize, HeapSize) ->
     {ok, Port} = new(ThreadStackSize, HeapSize, no_json),
     %% Load json converter for use later
-    case define_js(Port, <<"json2.js">>, json_converter(), ?SCRIPT_TIMEOUT) of
-        ok ->
-            {ok, Port};
-        {error, Reason} ->
-            port_close(Port),
-            {error, Reason}
-    end.
+    {ok, Port}.
 
 %% @type init_fun() = function(port()).
 %% @spec new(int(), int(), no_json | init_fun() | {ModName::atom(), FunName::atom()}) -> {ok, port()} | {error, atom()} | {error, any()}
@@ -171,7 +165,7 @@ jsonify(Code) when is_binary(Code) ->
             _ ->
                 Code
         end,
-    list_to_binary([<<"JSON.stringify(">>, C, <<");">>]).
+    list_to_binary([<<"$js_driver::json->encode(">>, C, <<");">>]).
 
 %% @private
 priv_dir() ->
@@ -205,14 +199,3 @@ call_driver(Ctx, Command, Args, Timeout) ->
 make_call_token() ->
     list_to_binary(integer_to_list(erlang:phash2(erlang:make_ref()))).
 
-%% @private
-json_converter() ->
-    FileName = filename:join([priv_dir(), "json2.js"]),
-    case js_cache:fetch(FileName) of
-        none ->
-            {ok, Contents} = file:read_file(FileName),
-            js_cache:store(FileName, Contents),
-            Contents;
-        Contents ->
-            Contents
-    end.

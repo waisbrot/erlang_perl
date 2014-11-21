@@ -18,28 +18,41 @@
 #include <stdint.h>
 #include <erl_driver.h>
 
-#include "spidermonkey.h"
 #include "config.h"
 #include "driver_comm.h"
 #include "erl_compatibility.h"
+#include <EXTERN.h>
+#include <perl.h>
+extern char **environ;
 
-typedef struct _spidermonkey_drv_t {
+EXTERN_C void boot_DynaLoader (pTHX_ CV* cv);
+
+void
+xs_init(pTHX)
+{
+    char *file = __FILE__;
+    dXSUB_SYS;
+
+    newXS("DynaLoader::boot_DynaLoader", boot_DynaLoader, file);
+}
+
+typedef struct _perl_drv_t {
   ErlDrvPort port;
-  spidermonkey_vm *vm;
+  PerlInterpreter *vm;
   ErlDrvTermData atom_ok;
   ErlDrvTermData atom_error;
   ErlDrvTermData atom_unknown_cmd;
   int shutdown;
-} spidermonkey_drv_t;
+} perl_drv_t;
 
-typedef struct _js_call_t {
-  spidermonkey_drv_t *driver_data;
+typedef struct _perl_call_t {
+  perl_drv_t *driver_data;
   ErlDrvBinary *args;
   ErlDrvTermData return_terms[20];
   char return_call_id[32];
   int return_term_count;
   const char *return_string;
-} js_call;
+} perl_call;
 
 typedef void (*asyncfun)(void *);
 
@@ -51,14 +64,14 @@ static void stop(ErlDrvData handle);
 static void process(ErlDrvData handle, ErlIOVec *ev);
 static void ready_async(ErlDrvData handle, ErlDrvThreadData async_data);
 
-static ErlDrvEntry spidermonkey_drv_entry = {
+static ErlDrvEntry perl_drv_entry = {
     init,                             /* init */
     start,                            /* startup */
     stop,                             /* shutdown */
     NULL,                             /* output */
     NULL,                             /* ready_input */
     NULL,                             /* ready_output */
-    (char *) "erlang_js_drv",         /* the name of the driver */
+    (char *) "erlang_perl_drv",         /* the name of the driver */
     NULL,                             /* finish */
     NULL,                             /* handle */
     NULL,                             /* control */
@@ -75,7 +88,7 @@ static ErlDrvEntry spidermonkey_drv_entry = {
 };
 
 
-void send_immediate_ok_response(spidermonkey_drv_t *dd, const char *call_id) {
+void send_immediate_ok_response(perl_drv_t *dd, const char *call_id) {
   ErlDrvTermData terms[] = {ERL_DRV_BUF2BINARY, (ErlDrvTermData) call_id, strlen(call_id),
                             ERL_DRV_ATOM, dd->atom_ok,
                             ERL_DRV_TUPLE, 2};
@@ -91,7 +104,7 @@ void send_immediate_ok_response(spidermonkey_drv_t *dd, const char *call_id) {
          CD->return_term_count = sizeof(TERMS) / sizeof(TERMS[0]); \
     } while (0)
 
-void send_ok_response(spidermonkey_drv_t *dd, js_call *call_data,
+void send_ok_response(perl_drv_t *dd, perl_call *call_data,
                       const char *call_id) {
   ErlDrvTermData terms[] = {ERL_DRV_BUF2BINARY,
                             (ErlDrvTermData) call_data->return_call_id,strlen(call_id),
@@ -100,7 +113,7 @@ void send_ok_response(spidermonkey_drv_t *dd, js_call *call_data,
   COPY_DATA(call_data, call_id, terms);
 }
 
-void send_error_string_response(spidermonkey_drv_t *dd, js_call *call_data,
+void send_error_string_response(perl_drv_t *dd, perl_call *call_data,
                                 const char *call_id, const char *msg) {
   ErlDrvTermData terms[] = {ERL_DRV_BUF2BINARY,
                             (ErlDrvTermData) call_data->return_call_id,strlen(call_id),
@@ -111,7 +124,7 @@ void send_error_string_response(spidermonkey_drv_t *dd, js_call *call_data,
   call_data->return_string = msg;
 }
 
-void send_string_response(spidermonkey_drv_t *dd, js_call *call_data,
+void send_string_response(perl_drv_t *dd, perl_call *call_data,
                           const char *call_id, const char *result) {
   ErlDrvTermData terms[] = {ERL_DRV_BUF2BINARY,
                             (ErlDrvTermData) call_data->return_call_id,strlen(call_id),
@@ -122,7 +135,7 @@ void send_string_response(spidermonkey_drv_t *dd, js_call *call_data,
   call_data->return_string = result;
 }
 
-void unknown_command(spidermonkey_drv_t *dd, js_call *call_data,
+void unknown_command(perl_drv_t *dd, perl_call *call_data,
                      const char *call_id) {
   ErlDrvTermData terms[] = {ERL_DRV_BUF2BINARY,
                             (ErlDrvTermData) call_data->return_call_id,strlen(call_id),
@@ -132,9 +145,37 @@ void unknown_command(spidermonkey_drv_t *dd, js_call *call_data,
   COPY_DATA(call_data, call_id, terms);
 }
 
+char *sm_eval(PerlInterpreter *vm, const char *filename, const char *code, int handle_retval) {
+  char *retval = NULL;
+
+  if (code == NULL) {
+      return NULL;
+  }
+
+  //printf("Input: %s\n", code);
+
+  PERL_SET_CONTEXT(vm);
+  PL_exit_flags |= PERL_EXIT_DESTRUCT_END;
+
+  SV* ret_sv = eval_pv(code, FALSE);
+  if (SvTRUE(ERRSV))
+  {
+    printf("Error! %s\n", SvPV(ERRSV, PL_na));
+  } else if (handle_retval) {
+      if (handle_retval) {
+          STRLEN len;
+          char *xret = SvPV(ret_sv, len);
+          retval = eperl_alloc(len);
+          memcpy(retval, xret, len+1);
+      }
+  }
+
+  return retval;
+}
+
 void run_js(void *jsargs) {
-  js_call *call_data = (js_call *) jsargs;
-  spidermonkey_drv_t *dd = call_data->driver_data;
+  perl_call *call_data = (perl_call *) jsargs;
+  perl_drv_t *dd = call_data->driver_data;
   ErlDrvBinary *args = call_data->args;
   char *data = args->orig_bytes;
   char *command = read_command(&data);
@@ -177,17 +218,19 @@ void run_js(void *jsargs) {
   driver_free(call_id);
 }
 
-DRIVER_INIT(spidermonkey_drv) {
-  return &spidermonkey_drv_entry;
+DRIVER_INIT(perl_drv) {
+  return &perl_drv_entry;
 }
 
 static int init(void) {
-  sm_configure_locale();
+  char *argv[] = { };
+  int argc = 0;
+  PERL_SYS_INIT3(&argc,&argv, &environ);
   return 0;
 }
 
 static ErlDrvData start(ErlDrvPort port, char *cmd) {
-  spidermonkey_drv_t *retval = ejs_alloc(sizeof(spidermonkey_drv_t));
+  perl_drv_t *retval = eperl_alloc(sizeof(perl_drv_t));
   retval->port = port;
   retval->shutdown = 0;
   retval->atom_ok = driver_mk_atom((char *) "ok");
@@ -203,8 +246,17 @@ static ErlDrvData start(ErlDrvPort port, char *cmd) {
   return (ErlDrvData) retval;
 }
 
+void sm_shutdown(void) {
+     printf("Shutdown\n");
+     PERL_SYS_TERM();
+}
+void sm_stop(PerlInterpreter *vm) {
+     printf("Stop\n");
+     perl_destruct(vm);
+     perl_free(vm);
+}
 static void stop(ErlDrvData handle) {
-  spidermonkey_drv_t *dd = (spidermonkey_drv_t*) handle;
+  perl_drv_t *dd = (perl_drv_t*) handle;
   if(dd->vm != NULL) {
     sm_stop(dd->vm);
   }
@@ -215,11 +267,12 @@ static void stop(ErlDrvData handle) {
 }
 
 static void process(ErlDrvData handle, ErlIOVec *ev) {
-  spidermonkey_drv_t *dd = (spidermonkey_drv_t *) handle;
+  perl_drv_t *dd = (perl_drv_t *) handle;
 
   char *data = ev->binv[1]->orig_bytes;
   char *command = read_command(&data);
   if (strncmp(command, "ij", 2) == 0) {
+    char *embedding[] = { "", "-MJSON::XS", "-e", "0" };
     char *call_id = read_string(&data);
     int thread_stack = read_int32(&data);
     if (thread_stack < 8) {
@@ -227,12 +280,20 @@ static void process(ErlDrvData handle, ErlIOVec *ev) {
     }
     thread_stack = thread_stack * (1024 * 1024);
     int heap_size = read_int32(&data) * (1024 * 1024);
-    dd->vm = sm_initialize(thread_stack, heap_size);
+    dd->vm = perl_alloc();
+    perl_construct( dd->vm );
+    perl_parse(dd->vm, xs_init, 4, embedding, NULL);
+    eval_pv("$js_driver::json = JSON::XS->new->allow_nonref;", FALSE);
+    if (SvTRUE(ERRSV))
+    {
+        printf("Error! %s\n", SvPV(ERRSV, PL_na));
+    }
+
     send_immediate_ok_response(dd, call_id);
     driver_free(call_id);
   }
   else {
-    js_call *call_data = ejs_alloc(sizeof(js_call));
+    perl_call *call_data = eperl_alloc(sizeof(perl_call));
     call_data->driver_data = dd;
     call_data->args = ev->binv[1];
     call_data->return_terms[0] = 0;
@@ -250,8 +311,8 @@ static void process(ErlDrvData handle, ErlIOVec *ev) {
 static void
 ready_async(ErlDrvData handle, ErlDrvThreadData async_data)
 {
-  spidermonkey_drv_t *dd = (spidermonkey_drv_t *) handle;
-  js_call *call_data = (js_call *) async_data;
+  perl_drv_t *dd = (perl_drv_t *) handle;
+  perl_call *call_data = (perl_call *) async_data;
 
   driver_output_term(dd->port,
                    call_data->return_terms, call_data->return_term_count);

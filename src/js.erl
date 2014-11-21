@@ -54,10 +54,7 @@ call(Ctx, FunctionName, Args) ->
 call(Ctx, FunctionName, Args, Bindings) ->
     JsBindings = list_to_binary(build_bindings(Bindings, [])),
     ArgList = build_arg_list(Args, []),
-    EscapedFunctionName = binary:replace(FunctionName, <<"\"">>, <<"\\\"">>, [global]),
-    Js = iolist_to_binary([<<"function() {">>, JsBindings, <<" if (">>, FunctionName, <<" === undefined) { throw(\"">>,
-                           EscapedFunctionName, <<" not defined\"); } ">>,
-                           <<"return ">>, FunctionName, <<"(">>, ArgList, <<");">>, <<"}();">>]),
+    Js = iolist_to_binary([JsBindings, FunctionName, <<"->(">>, ArgList, <<")">> ]),
     js_driver:eval_js(Ctx, Js).
 
 %% Internal functions
