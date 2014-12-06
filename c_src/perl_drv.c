@@ -1,4 +1,6 @@
 /* author Kevin Smith <ksmith@basho.com>
+    perl_destruct(my_perl);
+    perl_free(my_perl);
    copyright 2009-2010 Basho Technologies
 
    Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,26 +25,18 @@
 #include "erl_compatibility.h"
 #include <EXTERN.h>
 #include <perl.h>
+#define CV_NAMESPACE "ErlDriver::_subs"
 extern char **environ;
 
-EXTERN_C void boot_DynaLoader (pTHX_ CV* cv);
-
-void
-xs_init(pTHX)
-{
-    char *file = __FILE__;
-    dXSUB_SYS;
-
-    newXS("DynaLoader::boot_DynaLoader", boot_DynaLoader, file);
-}
+EXTERN_C void xs_init (pTHX);
+static PerlInterpreter *my_perl = NULL;
+static SV *json_object = NULL;
 
 typedef struct _perl_drv_t {
   ErlDrvPort port;
-  PerlInterpreter *vm;
   ErlDrvTermData atom_ok;
   ErlDrvTermData atom_error;
   ErlDrvTermData atom_unknown_cmd;
-  int shutdown;
 } perl_drv_t;
 
 typedef struct _perl_call_t {
@@ -61,6 +55,8 @@ typedef void (*asyncfun)(void *);
 static ErlDrvData start(ErlDrvPort port, char *cmd);
 static int init(void);
 static void stop(ErlDrvData handle);
+static void finish(void);
+
 static void process(ErlDrvData handle, ErlIOVec *ev);
 static void ready_async(ErlDrvData handle, ErlDrvThreadData async_data);
 
@@ -72,7 +68,7 @@ static ErlDrvEntry perl_drv_entry = {
     NULL,                             /* ready_input */
     NULL,                             /* ready_output */
     (char *) "erlang_perl_drv",         /* the name of the driver */
-    NULL,                             /* finish */
+    finish,                             /* finish */
     NULL,                             /* handle */
     NULL,                             /* control */
     NULL,                             /* timeout */
@@ -145,32 +141,160 @@ void unknown_command(perl_drv_t *dd, perl_call *call_data,
   COPY_DATA(call_data, call_id, terms);
 }
 
-char *sm_eval(PerlInterpreter *vm, const char *filename, const char *code, int handle_retval) {
-  char *retval = NULL;
+int sv_to_json(SV* input, char **dst) {
+    AV *wrapper = av_make(1, &input);
 
-  if (code == NULL) {
-      return NULL;
-  }
+    STRLEN len;
+    int retval;
 
-  //printf("Input: %s\n", code);
+    dSP;
+    ENTER;
+    SAVETMPS;
+    PUSHMARK(SP);
+    XPUSHs(json_object);
+    XPUSHs(newRV((SV*)wrapper));
+    PUTBACK;
+    int count = call_method("encode", G_EVAL);
+    SPAGAIN;
+    if (SvTRUE(ERRSV))
+    {
+        STRLEN len;
+        char *errmsg = SvPV(ERRSV, len);
+        *dst = eperl_alloc(len+1);
+        memcpy(*dst, errmsg, len+1);
+        retval = 0;
+    } else {
+        SV *encoded_result = POPs;
+        char *json_ptr = SvPV(encoded_result, len);
+        *dst = eperl_alloc(len+1);
+        memcpy(*dst, json_ptr, len+1);
+        retval = 1;
+    }
 
-  PERL_SET_CONTEXT(vm);
-  PL_exit_flags |= PERL_EXIT_DESTRUCT_END;
+    PUTBACK;
+    FREETMPS;
+    LEAVE;
+    return retval;
+}
 
+
+
+void _build_interpreter() {
+    char *embedding[] = { "", "-MJSON::XS", "-e", "0" };
+    my_perl = perl_alloc();
+    perl_construct(my_perl);
+    perl_parse(my_perl, xs_init, 4, embedding, environ);
+    perl_run(my_perl);
+
+    json_object = eval_pv("JSON::XS->new->allow_nonref", TRUE);
+}
+void _destroy_interpreter() {
+    perl_destruct(my_perl);
+    perl_free(my_perl);
+    my_perl = NULL;
+}
+
+int perl_eval(const char *code, char **result) {
   SV* ret_sv = eval_pv(code, FALSE);
   if (SvTRUE(ERRSV))
   {
-    printf("Error! %s\n", SvPV(ERRSV, PL_na));
-  } else if (handle_retval) {
-      if (handle_retval) {
-          STRLEN len;
-          char *xret = SvPV(ret_sv, len);
-          retval = eperl_alloc(len);
-          memcpy(retval, xret, len+1);
-      }
+    STRLEN len;
+    char *errmsg = SvPV(ERRSV, len);
+    *result = eperl_alloc(len+1);
+    memcpy(*result, errmsg, len+1);
+    return 0;
+  } else if (result != NULL) {
+    sv_to_json(ret_sv, result);
   }
+  return 1;
+}
 
-  return retval;
+char *perl_run_cv(const char *sub, SV *args) {
+    char *retval = NULL;
+
+    if (sub == NULL) {
+        return NULL;
+    }
+
+    char * full_name = eperl_alloc(sizeof(CV_NAMESPACE) + 2 + strlen(sub));
+    sprintf(full_name, "%s::%s", CV_NAMESPACE, sub);
+    CV *cv = get_cv(full_name, 0);
+    if (cv == NULL) {
+        warn("No such CV: '%s'\n", full_name);
+        goto end_run_cv;
+    }
+
+    dSP;
+
+    ENTER;
+    SAVETMPS;
+    PUSHMARK(SP);
+    if (args) {
+        XPUSHs(args);
+        PUTBACK;
+    }
+
+    int number = call_sv((SV*) cv, G_SCALAR|G_KEEPERR);
+
+    SPAGAIN;
+
+    if (number == 1) {
+        SV *result = POPs;
+        sv_to_json(result, &retval);
+    } else {
+        warn("Wrong number of values returned: '%i'\n", number);
+    }
+
+    PUTBACK;
+    FREETMPS;
+    LEAVE;
+
+    end_run_cv:
+    driver_free(full_name);
+
+    return retval;
+}
+
+
+int perl_compile_cv(const char *code, char **result) {
+    SV *svcv = eval_pv(code, FALSE);
+    if (SvTRUE(ERRSV))
+    {
+        STRLEN len;
+        char *errmsg = SvPV(ERRSV, len);
+        *result = eperl_alloc( len + 1);
+        memcpy( *result, errmsg, len + 1);
+        return 0;
+    } else {
+
+        /* Dereference */
+        if (SvROK(svcv)) {
+            svcv = SvRV(svcv);
+        }
+
+        if (SvTYPE(svcv) == SVt_PVCV) {
+            SvREFCNT_inc(svcv);
+
+            GV *gv = (GV*)SvREFCNT_inc(newGVgen(CV_NAMESPACE));
+            if ( GvCV(gv) )
+                die("cv '%s' already exists", SvPV_nolen((SV*)gv));
+
+            GvCV_set(gv, (CV*)svcv);
+            STRLEN len;
+            char *name = SvPV((SV*)gv, len);
+            name += sizeof(CV_NAMESPACE) + 2;
+            len -= sizeof(CV_NAMESPACE) + 2;
+            *result = eperl_alloc( len + 1);
+            memcpy( (void*)*result, name, len + 1);
+        } else {
+            STRLEN len;
+            char *obj = SvPV(svcv, len);
+            *result = eperl_alloc( sizeof("code \"%s\" returned something that is not a code reference: \"%s\"") + strlen(code) + len);
+            sprintf(*result,"code \"%s\" returned something that is not a code reference: \"%s\"", code, obj);
+            return 0;
+        }
+    }
+    return 1;
 }
 
 void run_js(void *jsargs) {
@@ -181,35 +305,74 @@ void run_js(void *jsargs) {
   char *command = read_command(&data);
   char *call_id = read_string(&data);
   char *result = NULL;
-  if (strncmp(command, "ej", 2) == 0) {
-    char *filename = read_string(&data);
+
+  if (strncmp(command, "rp", 2) == 0) {
+    _destroy_interpreter();
+    _build_interpreter();
+    send_ok_response(dd, call_data, call_id);
+  }
+  else if (strncmp(command, "ip", 2) == 0) {
     char *code = read_string(&data);
-    result = sm_eval(dd->vm, filename, code, 1);
-    if ((strncmp(result, "[{\"error\":\"notfound\"}]", 22) == 0) || (strncmp(result, "{\"error\"", 8) == 0)) {
+    int ok = perl_compile_cv(code, &result);
+    if (ok) {
+        send_string_response(dd, call_data, call_id, result);
+    } else {
         send_error_string_response(dd, call_data, call_id, result);
     }
-    else {
-        send_string_response(dd, call_data, call_id, result);
+    driver_free(code);
+  }
+  else if (strncmp(command, "cp", 2) == 0) {
+    char *sub = read_string(&data);
+    char *args_json = read_string(&data);
+    SV *args = NULL;
+    if (args_json[0] != 0) {
+        dSP;
+        ENTER;
+        SAVETMPS;
+        PUSHMARK(SP);
+        XPUSHs(json_object);
+        XPUSHs(newSVpv(args_json, 0));
+        PUTBACK;
+        int count = call_method("decode", G_SCALAR);
+        SPAGAIN;
+        args = newSVsv(POPs);
+        PUTBACK;
+        FREETMPS;
+        LEAVE;
     }
-    driver_free(filename);
+
+    result = perl_run_cv(sub, args);
+
+    if (result == NULL) {
+        result =  eperl_alloc(1);
+        result[0] = 0;
+    }
+
+    send_string_response(dd, call_data, call_id, result);
+    driver_free(sub);
+    driver_free(args_json);
+  }
+  else if (strncmp(command, "ep", 2) == 0) {
+    char *code = read_string(&data);
+    if (perl_eval(code, &result)) {
+      send_string_response(dd, call_data, call_id, result);
+    }
+    else {
+      send_error_string_response(dd, call_data, call_id, result);
+    }
     driver_free(code);
   }
   else if (strncmp(command, "dj", 2) == 0) {
     char *filename = read_string(&data);
     char *code = read_string(&data);
-    result = sm_eval(dd->vm, filename, code, 0);
-    if (result == NULL) {
-      send_ok_response(dd, call_data, call_id);
+    if (perl_eval(code, &result)) {
+      send_string_response(dd, call_data, call_id, result);
     }
     else {
       send_error_string_response(dd, call_data, call_id, result);
     }
     driver_free(filename);
     driver_free(code);
-  }
-  else if (strncmp(command, "sd", 2) == 0) {
-    dd->shutdown = 1;
-    send_ok_response(dd, call_data, call_id);
   }
   else {
     unknown_command(dd, call_data, call_id);
@@ -223,16 +386,19 @@ DRIVER_INIT(perl_drv) {
 }
 
 static int init(void) {
-  char *argv[] = { };
-  int argc = 0;
-  PERL_SYS_INIT3(&argc,&argv, &environ);
+  static int sa = 0;
+  if (!sa++) {
+    char *argv[] = { };
+    int argc = 0;
+    PERL_SYS_INIT3(&argc, (char ***)&argv, &environ);
+    _build_interpreter();
+  }
   return 0;
 }
 
 static ErlDrvData start(ErlDrvPort port, char *cmd) {
   perl_drv_t *retval = eperl_alloc(sizeof(perl_drv_t));
   retval->port = port;
-  retval->shutdown = 0;
   retval->atom_ok = driver_mk_atom((char *) "ok");
   retval->atom_error = driver_mk_atom((char *) "error");
   retval->atom_unknown_cmd = driver_mk_atom((char *) "unknown_command");
@@ -246,65 +412,33 @@ static ErlDrvData start(ErlDrvPort port, char *cmd) {
   return (ErlDrvData) retval;
 }
 
-void sm_shutdown(void) {
-     printf("Shutdown\n");
+static void finish(void) {
+     _destroy_interpreter();
      PERL_SYS_TERM();
 }
-void sm_stop(PerlInterpreter *vm) {
-     printf("Stop\n");
-     perl_destruct(vm);
-     perl_free(vm);
-}
+
 static void stop(ErlDrvData handle) {
   perl_drv_t *dd = (perl_drv_t*) handle;
-  if(dd->vm != NULL) {
-    sm_stop(dd->vm);
-  }
-  if (dd->shutdown) {
-    sm_shutdown();
-  }
   driver_free(dd);
 }
 
 static void process(ErlDrvData handle, ErlIOVec *ev) {
   perl_drv_t *dd = (perl_drv_t *) handle;
-
   char *data = ev->binv[1]->orig_bytes;
   char *command = read_command(&data);
-  if (strncmp(command, "ij", 2) == 0) {
-    char *embedding[] = { "", "-MJSON::XS", "-e", "0" };
-    char *call_id = read_string(&data);
-    int thread_stack = read_int32(&data);
-    if (thread_stack < 8) {
-      thread_stack = 8;
-    }
-    thread_stack = thread_stack * (1024 * 1024);
-    int heap_size = read_int32(&data) * (1024 * 1024);
-    dd->vm = perl_alloc();
-    perl_construct( dd->vm );
-    perl_parse(dd->vm, xs_init, 4, embedding, NULL);
-    eval_pv("$js_driver::json = JSON::XS->new->allow_nonref;", FALSE);
-    if (SvTRUE(ERRSV))
-    {
-        printf("Error! %s\n", SvPV(ERRSV, PL_na));
-    }
 
-    send_immediate_ok_response(dd, call_id);
-    driver_free(call_id);
-  }
-  else {
-    perl_call *call_data = eperl_alloc(sizeof(perl_call));
-    call_data->driver_data = dd;
-    call_data->args = ev->binv[1];
-    call_data->return_terms[0] = 0;
-    call_data->return_term_count = 0;
-    call_data->return_string = NULL;
-    driver_binary_inc_refc(call_data->args);
-    ErlDrvPort port = dd->port;
-    intptr_t port_ptr = (intptr_t) port;
-    unsigned int thread_key = port_ptr;
-    driver_async(dd->port, &thread_key, (asyncfun) run_js, (void *) call_data, NULL);
-  }
+  perl_call *call_data = eperl_alloc(sizeof(perl_call));
+  call_data->driver_data = dd;
+  call_data->args = ev->binv[1];
+  call_data->return_terms[0] = 0;
+  call_data->return_term_count = 0;
+  call_data->return_string = NULL;
+  driver_binary_inc_refc(call_data->args);
+  ErlDrvPort port = dd->port;
+  intptr_t port_ptr = (intptr_t) port;
+  unsigned int thread_key = port_ptr;
+  driver_async(dd->port, &thread_key, (asyncfun) run_js, (void *) call_data, NULL);
+
   driver_free(command);
 }
 

@@ -34,17 +34,17 @@ do(error, 0) ->
     ok;
 do(error, Count) ->
     show_count(Count),
-    {ok, P} = js_driver:new(),
+    {ok, P} = perl_driver:new(),
     {error, _Error} = js:define(P, <<"function foo(;">>),
-    js_driver:destroy(P),
+    perl_driver:destroy(P),
     do(error, Count - 1);
 
 do(new, 0) ->
     ok;
 do(new, Count) ->
     show_count(Count),
-    {ok, P} = js_driver:new(),
-    js_driver:destroy(P),
+    {ok, P} = perl_driver:new(),
+    perl_driver:destroy(P),
     do(new, Count - 1).
 
 end_test() ->

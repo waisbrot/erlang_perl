@@ -15,7 +15,7 @@
 
 %% @doc Top level supervisor for erlang_js. It is chiefly responsible for
 %% the js_cache file cache process.
--module(erlang_js_sup).
+-module(erlang_perl_sup).
 
 -behaviour(supervisor).
 
@@ -43,9 +43,9 @@ init([]) ->
     Shutdown = 2000,
     Type = worker,
 
-    case js_driver:load_driver() of
+    case perl_driver:load_driver() of
         false ->
-            throw({error, {load_error, "Failed to load erlang_js_drv.so"}});
+            throw({error, {load_error, "Failed to load erlang_perl_drv.so"}});
         true ->
             Cache = {cache, {js_cache, start_link, []},
                      Restart, Shutdown, Type, [js_cache]},

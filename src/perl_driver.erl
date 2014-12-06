@@ -18,13 +18,11 @@
 %% as needed. This module is also reponsible for creating and destroying
 %% instances of Javascript VMs.
 
--module(js_driver).
+-module(perl_driver).
 
--define(DEFAULT_HEAP_SIZE, 8). %% MB
--define(DEFAULT_THREAD_STACK, 16). %% MB
-
--export([load_driver/0, new/0, new/2, new/3, destroy/1, shutdown/1]).
--export([define_js/2, define_js/3, define_js/4, eval_js/2, eval_js/3]).
+-export([load_driver/0, new/0, restart/1, destroy/1]).
+-export([define_perl/2, define_perl/3, eval_perl/2, eval_perl/3]).
+-export([call_perl_sub/2, call_perl_sub/3]).
 
 -define(SCRIPT_TIMEOUT, 5000).
 -define(DRIVER_NAME, "erlang_perl_drv").
@@ -51,127 +49,107 @@ load_driver() ->
 %% json2 converter (http://www.json.org/js.html). Uses a default heap
 %% size of 8MB and a default thread stack size of 8KB.
 new() ->
-    new(?DEFAULT_THREAD_STACK, ?DEFAULT_HEAP_SIZE).
-
-%% @spec new(ThreadStackSize::int(), HeapSize::int()) -> {ok, port()} | {error, atom()} | {error, any()}
-%% @doc Create a new Javascript VM instance and preload Douglas Crockford's
-%% json2 converter (http://www.json.org/js.html)
-new(ThreadStackSize, HeapSize) ->
-    {ok, Port} = new(ThreadStackSize, HeapSize, no_json),
-    %% Load json converter for use later
-    {ok, Port}.
+    new(no_json).
 
 %% @type init_fun() = function(port()).
 %% @spec new(int(), int(), no_json | init_fun() | {ModName::atom(), FunName::atom()}) -> {ok, port()} | {error, atom()} | {error, any()}
 %% @doc Create a new Javascript VM instance. The function arguments control how the VM instance is initialized.
 %% User supplied initializers must return true or false.
-new(ThreadStackSize, HeapSize, no_json) ->
+new(no_json) ->
     Port = open_port({spawn, ?DRIVER_NAME}, [binary]),
-    _ = call_driver(Port, "ij", [ThreadStackSize, HeapSize], 5000),
     {ok, Port};
-new(ThreadStackSize, HeapSize, Initializer) when is_function(Initializer) ->
-    {ok, Port} = new(ThreadStackSize, HeapSize),
+new(Initializer) when is_function(Initializer) ->
+    {ok, Port} = new(),
     case Initializer(Port) of
         ok ->
             {ok, Port};
         {error, Error} ->
-            js_driver:destroy(Port),
+            perl_driver:destroy(Port),
             error_logger:error_report(Error),
             throw({error, init_failed})
     end;
-new(ThreadStackSize, HeapSize, {InitMod, InitFun}) ->
-    {ok, Port} = new(ThreadStackSize, HeapSize),
+new({InitMod, InitFun}) ->
+    {ok, Port} = new(),
     case InitMod:InitFun(Port) of
         ok ->
             {ok, Port};
         {error, Error} ->
-            js_driver:destroy(Port),
+            perl_driver:destroy(Port),
             error_logger:error_report(Error),
             throw({error, init_failed})
     end.
+
+%% @spec restart(port()) -> ok
+%% @doc Destroys a Perl VM instance
+restart(Ctx) ->
+    call_driver(Ctx, "rp", [], 60000).
 
 %% @spec destroy(port()) -> ok
 %% @doc Destroys a Javascript VM instance
 destroy(Ctx) ->
     port_close(Ctx).
 
-%% @spec shutdown(port()) -> ok
-%% @doc Destroys a Javascript VM instance and shuts down the underlying Javascript infrastructure.
-%% NOTE: No new VMs can be created after this call is made!
-shutdown(Ctx) ->
-    _ = call_driver(Ctx, "sd", [], 60000),
-    port_close(Ctx).
-
-%% @spec define_js(port(), binary()) -> ok | {error, any()}
+%% @spec define_perl(port(), binary()) -> ok | {error, any()}
 %% @doc Define a Javascript expression:
-%% js_driver:define(Port, &lt;&lt;"var x = 100;"&gt;&gt;).
-define_js(Ctx, Js) ->
-    define_js(Ctx, Js, ?SCRIPT_TIMEOUT).
+%% perl_driver:define(Port, &lt;&lt;"var x = 100;"&gt;&gt;).
+define_perl(Ctx, Perl) ->
+    define_perl(Ctx, Perl, ?SCRIPT_TIMEOUT).
 
 %% @private
-define_js(Ctx, {file, FileName}, Timeout) ->
-    {ok, File} = file:read_file(FileName),
-    define_js(Ctx, list_to_binary(FileName), File, Timeout);
-define_js(Ctx, Js, Timeout) when is_binary(Js) ->
-    define_js(Ctx, <<"unnamed">>, Js, Timeout).
+%%define_perl(Ctx, {file, FileName}, Timeout) ->
+%%    {ok, File} = file:read_file(FileName),
+%%    _ = file,
+%%    define_perl(Ctx, File, Timeout);
 
-%% @spec define_js(port(), binary(), binary(), integer()) -> {ok, binary()} | {error, any()}
-%% @doc Define a Javascript expression:
-%% js_driver:define(Port, &lt;&lt;var blah = new Wubba();"&gt;&gt;).
-%% Note: Filename is used only as a label for error reporting.
-define_js(Ctx, FileName, Js, Timeout) when is_binary(FileName),
-                                           is_binary(Js) ->
-    case call_driver(Ctx, "dj", [FileName, Js], Timeout) of
-        {error, ErrorJson} when is_binary(ErrorJson) ->
-            {struct, [{<<"error">>, {struct, Error}}]} = js_mochijson2:decode(ErrorJson),
-            {error, Error};
+%% @spec define_perl(port(), binary(), integer()) -> {ok, binary()} | {error, any()}
+%% @doc Define anonymous Perl subroutine:
+define_perl(Ctx, Perl, Timeout) when is_binary(Perl) ->
+    case call_driver(Ctx, "ip", [Perl], Timeout) of
+        {ok, Result} ->
+            {ok, Result};
         {error, Error} ->
             {error, Error};
         ok ->
             ok
     end.
 
-%% @spec eval_js(port(), binary()) -> {ok, any()} | {error, any()}
-%% @doc Evaluate a Javascript expression and return the result
-eval_js(Ctx, Js) ->
-    eval_js(Ctx, Js, ?SCRIPT_TIMEOUT).
+call_perl_sub(Ctx, SubName) ->
+    call_perl_sub(Ctx, SubName, [], ?SCRIPT_TIMEOUT).
+
+call_perl_sub(Ctx, SubName, Payload) ->
+    call_perl_sub(Ctx, SubName, Payload, ?SCRIPT_TIMEOUT).
+
+call_perl_sub(Ctx, SubName, Payload, Timeout) ->
+    case call_driver(Ctx, "cp", [SubName, list_to_binary(perl_mochijson2:encode(Payload))], Timeout) of
+        {error, ErrorJson} when is_binary(ErrorJson) ->
+            erlang:display(ErrorJson),
+            {struct, [{<<"error">>, {struct, Error}}]} = perl_mochijson2:decode(ErrorJson),
+            {error, Error};
+        {ok, Result} ->
+            {ok, hd(perl_mochijson2:decode(Result))};
+        {error, Error} ->
+            {error, Error};
+        ok ->
+            ok
+    end.
 
 %% @private
-eval_js(Ctx, {file, FileName}, Timeout) ->
-    {ok, File} = file:read_file(FileName),
-    eval_js(Ctx, File, Timeout);
-eval_js(Ctx, Js, Timeout) when is_binary(Js) ->
-    case call_driver(Ctx, "ej", [<<"<unnamed>">>, jsonify(Js)], Timeout) of
+eval_perl(Ctx, Code) when is_binary(Code) ->
+    eval_perl(Ctx, Code, ?SCRIPT_TIMEOUT).
+
+eval_perl(Ctx, Code, Timeout) when is_binary(Code) ->
+    case call_driver(Ctx, "ep", [Code], Timeout) of
         {ok, Result} ->
-            {ok, js_mochijson2:decode(Result)};
-        {error, ErrorJson} when is_binary(ErrorJson) ->
-            case js_mochijson2:decode(ErrorJson) of
-                {struct, [{<<"error">>, {struct, Error}}]} ->
-                    {error, Error};
-                _ ->
-                    {error, ErrorJson}
-            end;
+            {ok, hd(perl_mochijson2:decode(Result))};
         {error, Error} ->
             {error, Error}
     end.
-
-%% Internal functions
-%% @private
-jsonify(Code) when is_binary(Code) ->
-    {Body, <<LastChar:8>>} = split_binary(Code, size(Code) - 1),
-    C = case LastChar of
-            $; ->
-                Body;
-            _ ->
-                Code
-        end,
-    list_to_binary([<<"$js_driver::json->encode(">>, C, <<");">>]).
 
 %% @private
 priv_dir() ->
     %% Hacky workaround to handle running from a standard app directory
     %% and .ez package
-    case code:priv_dir(erlang_js) of
+    case code:priv_dir(erlang_perl) of
         {error, bad_name} ->
             filename:join([filename:dirname(code:which(?MODULE)), "..", "priv"]);
         Dir ->

@@ -55,7 +55,7 @@ char *read_string(char **data) {
 void *eperl_alloc(ErlDrvSizeT size) {
     void *p = driver_alloc(size);
     if (p == NULL) {
-        erl_exit(1, "erlang_js: Can't allocate %lu bytes of memory\n", size);
+        erl_exit(1, "erlang_perl: Can't allocate %lu bytes of memory\n", size);
     }
     return p;
 }

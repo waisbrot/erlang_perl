@@ -1,19 +1,17 @@
 -module(test_util).
 
--export([port_setup/0, port_setup/1, port_teardown/1, null_teardown/1, get_thing/0]).
+-export([port_setup/0, port_teardown/1, null_teardown/1, get_thing/0]).
 
 port_setup() ->
-    port_setup(8).
-
-port_setup(Size) ->
-  {ok, P} = js_driver:new(8, Size),
+  {ok, P} = perl_driver:new(),
+  perl_driver:restart(P),
   start_thing_holder(P),
   P.
 
 port_teardown(P) ->
   thing_holder ! stop,
   erlang:port_connect(P, self()),
-  js_driver:destroy(P).
+  perl_driver:destroy(P).
 
 null_teardown(_) ->
   thing_holder ! stop,

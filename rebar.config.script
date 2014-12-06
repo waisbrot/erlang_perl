@@ -1,0 +1,10 @@
+PERL_LDOPTS = os:cmd("perl -MExtUtils::Embed -e ldopts"),
+PERL_CCOPTS = os:cmd("perl -MExtUtils::Embed -e ccopts"),
+ChangeConfig = [
+    {port_env, [
+            {"DRV_CFLAGS", "$DRV_CFLAGS " ++ string:strip(PERL_CCOPTS, both, 10)},
+            {"DRV_LDFLAGS",   string:strip(PERL_LDOPTS, both, 10) ++ " $DRV_LDFLAGS "}
+        ]
+    }
+],
+lists:keymerge(1,lists:keysort(1, ChangeConfig), lists:keysort(1, CONFIG)).

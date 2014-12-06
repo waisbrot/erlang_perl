@@ -29,10 +29,10 @@
 %% microseconds.
 run() ->
     ok = application:start(erlang_js),
-    {ok, Ctx} = js_driver:new(),
+    {ok, Ctx} = perl_driver:new(),
     ok = js:define(Ctx, <<"$add = sub { return $_[0] + $_[1]; }">>, []),
     Result = [time_calls(Ctx, Count) || Count <- ?COUNTS],
-    js_driver:destroy(Ctx),
+    perl_driver:destroy(Ctx),
     Result.
 
 %% @private
